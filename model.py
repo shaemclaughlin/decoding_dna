@@ -6,7 +6,8 @@ from functools import partial
 from typing import Any, Callable
 import jax
 import jax.numpy as jnp
-import orbax.checkpoint as jnp
+import numpy as np
+import orbax.checkpoint as ocp
 from flax import struct
 from jax.experimental import mesh_utils 
 from jax.experimental.pallas.ops.tpu import flash_attention
@@ -486,8 +487,8 @@ def apply_rotary_embedding(x, sin, cos):
 
     # Add singleton dimension for heads
     # [B, T, head_dim] -> [B, 1, T, head_dim]
-    sin, cos = sin[:, None, :, :, :]
-    cos[:, None, :, :] # [B, T, head_dim] --> [B, h, T, head_dim]
+    sin = sin[:, None, :, :]
+    cos = cos[:, None, :, :] # [B, T, head_dim] --> [B, h, T, head_dim]
     # Apply 2D rotation to each vector:
     # [x1] = [cos, -sin] [x1]
     # [x2]   [sin, cos] [x2]
@@ -606,7 +607,7 @@ def attention(
     # -> batch, heads, query time, dim
     return jnp.einsum("bhtT,bhTd->bhtd", attn, v).astype(jnp.bfloat16)
 
-def attention_kernal(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
+def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     """
     Purpose: Implements Flash Attention, a memory-efficient attention algorithm that processes attention in blocks to reduce memory usage
 
@@ -647,7 +648,7 @@ def attention_kernal(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
 
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
         # Create segment IDs object for Flash Attention
-        segment_ids = flash_attention.SegmentIDs(q_segment_ids, kv_segment_ids)
+        segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
 
         # Call Flash Attention implementation
         return flash_attention.flash_attention(
@@ -696,7 +697,7 @@ def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
     rms = jnp.sqrt(
         jnp.mean(
             jnp.astype(x, jnp.float32)**2,
-            axis=-1 # Normalize across feature dimension
+            axis=-1, # Normalize across feature dimension
             keepdims=True # Keep dims for broadcasting
         ) + 1e-6
     )
@@ -716,6 +717,7 @@ def forward_layer(
         cfg: Config, # Model config
         cache: KVCache | None = None, # Optional KV cache for inference
         internals: Any = None, # For storing intermediate values
+        store_activations: bool = False, # Whether to store activations
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Modified forward_layer function to optionally store residual stream activation"""
     
@@ -798,7 +800,7 @@ def forward_layer(
     # Compute attention
     with jax.named_scope("attention"):
         if cfg.use_attn_kernel and cache is None:
-            attn_out = attention_kernal(q, k, v, q_segment_ids, k_segment_ids, cfg)
+            attn_out = attention_kernel(q, k, v, q_segment_ids, k_segment_ids, cfg)
         else:
             attn_out = attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg, internals, idx)
 
@@ -922,7 +924,7 @@ def forward(
     if cache is not None:
         start_indices = cache.lengths # Use cache position for inference
     else:
-        start_indices = jnp.zeroes((batch,), dtype=jnp.int32)
+        start_indices = jnp.zeros((batch,), dtype=jnp.int32)
     
     positions = start_indices[:, None] + positions
     sin, cos = _generate_pos_embeddings(positions, cfg.key_dim,
@@ -1139,7 +1141,7 @@ def init_optimizer_state(weights: Weights):
 
     def _zeros_like(old):
         """Helper function to create zeros matching input tensor structure"""
-        if ininstance(old, jax.ShapeDtypeStruct):
+        if isinstance(old, jax.ShapeDtypeStruct):
             # For abstract tensors (shapes only), create matching structure
             return jax.ShapeDtypeStruct(
                 old.shape, # Same shape as parameter
@@ -1321,6 +1323,8 @@ def update_step(
         step: int, # Current training step
         cfg: Config, # Model configuration
         aux: Any | None, # Optional auxiliary data
+        store_activations: bool = False, # Whether to store activations
+        store_layer_idx: int = None,
         override_compute_loss_fn = None # Optional custom loss function
 ):
     """
